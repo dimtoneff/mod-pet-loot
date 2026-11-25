@@ -16,12 +16,29 @@
 PetLoot.Enable = 1
 
 #
-#    PetLoot.PetId
-#        Description: The Entry ID of the NPC mascot (Vanity Pet) that will perform the looting.
-#                     23234 is "Bananas" (TCG Monkey Pet).
-#        Default:     23234
+#    PetLoot.PetIds
+#        Description: Comma-separated list of creature entries (Vanity Pets) that will perform the looting.
+#                     Any pet whose entry is in the list can loot. Spaces around commas are allowed.
+#                     Default pets:
+#                       23234 - Bananas (TCG Monkey Pet)
+#                       7547  - Azure Whelpling
+#                       25146 - Golden Pig
+#                       37865 - Perky Pug
+#                       29089 - Mini Tyrael
+#                       26119 - Phoenix Hatchling
+#                       36911 - Pandaren Monk
+#                       36511 - Spectral Tiger Cub
+#        Default:     23234,7547,25146,37865,29089,26119,36911,36511
 
-PetLoot.PetId = 23234
+PetLoot.PetIds = 23234,7547,25146,37865,29089,26119,36911,36511
+
+#
+#    PetLoot.DebugLog
+#        Description: Enable verbose per-kill/group-scan diagnostics in the worldserver log.
+#        Default:     0 - (Disabled, no diagnostic logging)
+#                     1 - (Enabled, log verbose per-kill/group-scan diagnostics)
+
+PetLoot.DebugLog = 0
 
 #
 #    PetLoot.Radius

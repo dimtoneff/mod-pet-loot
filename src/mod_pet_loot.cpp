@@ -16,8 +16,19 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
+#include <cctype>
+#include <limits>
+#include <sstream>
 #include <set>
+#include <string>
 #include <vector>
+
+// Gate verbose per-kill/group-scan diagnostics behind PetLoot.DebugLog.
+#define PETLOOT_LOG(...)                                                 \
+    do {                                                                 \
+        if (PetLootConfig::instance()->DebugLog)                         \
+            LOG_INFO("module.pet_loot", __VA_ARGS__);                    \
+    } while (false)
 
 // Configuration class to store module settings
 class PetLootConfig
@@ -30,8 +41,9 @@ public:
     }
 
     bool Enabled;
-    uint32 PetId;
+    std::set<uint32> PetIds;
     float Radius;
+    bool DebugLog{false};
 
     // Prevents the pet from starting group loot rolls multiple times
     // for the same creature corpse.
@@ -40,13 +52,76 @@ public:
     void Load()
     {
         Enabled = sConfigMgr->GetOption<bool>("PetLoot.Enable", true);
-        PetId = sConfigMgr->GetOption<uint32>("PetLoot.PetId", 23234); // Default: Bananas
+        DebugLog = sConfigMgr->GetOption<bool>("PetLoot.DebugLog", false);
         Radius = sConfigMgr->GetOption<float>("PetLoot.Radius", 50.0f);
 
-        LOG_INFO("module.pet_loot", "Load: enabled={} petId={} radius={}",
-                 Enabled, PetLootConfig::instance()->PetId, PetLootConfig::instance()->Radius);
+        std::string petIdsCfg = sConfigMgr->GetOption<std::string>("PetLoot.PetIds",
+            "23234,7547,25146,37865,29089,26119,36911,36511");
+        PetIds.clear();
+        std::istringstream petIdsStream(petIdsCfg);
+        std::string token;
+        while (std::getline(petIdsStream, token, ','))
+        {
+            size_t begin = 0;
+            size_t end = token.size();
+            while (begin < end && std::isspace(static_cast<unsigned char>(token[begin])))
+                ++begin;
+            while (end > begin && std::isspace(static_cast<unsigned char>(token[end - 1])))
+                --end;
+
+            std::string id = token.substr(begin, end - begin);
+            if (id.empty())
+                continue;
+
+            bool digitsOnly = true;
+            for (char c : id)
+            {
+                if (!std::isdigit(static_cast<unsigned char>(c)))
+                {
+                    digitsOnly = false;
+                    break;
+                }
+            }
+
+            if (!digitsOnly)
+                continue;
+
+            try
+            {
+                unsigned long value = std::stoul(id);
+                if (value <= std::numeric_limits<uint32>::max())
+                    PetIds.insert(static_cast<uint32>(value));
+            }
+            catch (...)
+            {
+                // Ignore malformed or out-of-range entries.
+            }
+        }
+
+        if (PetIds.empty())
+        {
+            PETLOOT_LOG("PetLoot.PetIds parsed to empty; using default pet list");
+            PetIds.insert({ 23234, 7547, 25146, 37865, 29089, 26119, 36911, 36511 });
+        }
+
+        std::ostringstream idsStream;
+        bool firstId = true;
+        for (uint32 petId : PetIds)
+        {
+            if (!firstId)
+                idsStream << ',';
+            idsStream << petId;
+            firstId = false;
+        }
+        std::string idsText = idsStream.str();
+        PETLOOT_LOG("Load: enabled={} radius={} debugLog={} petIds=[{}]", Enabled, Radius, DebugLog, idsText);
     }
 };
+
+static bool IsLootPet(uint32 entry)
+{
+    return PetLootConfig::instance()->PetIds.count(entry) != 0;
+}
 
 // Resolve the player whose vanity pet should be moved to the corpse. The kill hook can
 // fire for a playerbot with no vanity pet, so fall back to the first eligible group member.
@@ -65,13 +140,13 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
             return false;
 
         Creature* critter = ObjectAccessor::GetCreature(*player, critterGuid);
-        if (!critter || !critter->IsAlive() || critter->GetEntry() != PetLootConfig::instance()->PetId)
+        if (!critter || !critter->IsAlive() || !IsLootPet(critter->GetEntry()))
             return false;
 
         if (!player->IsInMap(victim) || !player->InSamePhase(victim) ||
             !critter->IsInMap(victim) || !critter->InSamePhase(victim))
         {
-            LOG_INFO("module.pet_loot", "Candidate {} skipped: different map or phase", player->GetName());
+            PETLOOT_LOG("Candidate {} skipped: different map or phase", player->GetName());
             return false;
         }
 
@@ -85,16 +160,16 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
     };
 
     if (killer->GetSession() && killer->GetSession()->IsHeadless())
-        LOG_INFO("module.pet_loot", "Killer {} skipped: headless (bot) session", killer->GetName());
+        PETLOOT_LOG("Killer {} skipped: headless (bot) session", killer->GetName());
 
     if (hasPetNear(killer, nullptr))
         return killer;
 
-    LOG_INFO("module.pet_loot", "Scanning group of killer {} for pet owner", killer->GetName());
+    PETLOOT_LOG("Scanning group of killer {} for pet owner", killer->GetName());
     Group* group = killer->GetGroup();
     if (!group)
     {
-        LOG_INFO("module.pet_loot", "No pet owner found: killer {} is not in a group", killer->GetName());
+        PETLOOT_LOG("No pet owner found: killer {} is not in a group", killer->GetName());
         return nullptr;
     }
 
@@ -106,20 +181,20 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
 
         if (member->GetSession() && member->GetSession()->IsHeadless())
         {
-            LOG_INFO("module.pet_loot", "Group member {} skipped: headless (bot) session", member->GetName());
+            PETLOOT_LOG("Group member {} skipped: headless (bot) session", member->GetName());
             continue;
         }
 
         Creature* critter = nullptr;
         if (hasPetNear(member, &critter))
         {
-            LOG_INFO("module.pet_loot", "Selected pet looter {} critter entry {} dist {}",
-                     member->GetName(), critter->GetEntry(), member->GetDistance(victim));
+            PETLOOT_LOG("Selected pet looter {} critter entry {} dist {}",
+                        member->GetName(), critter->GetEntry(), member->GetDistance(victim));
             return member;
         }
     }
 
-    LOG_INFO("module.pet_loot", "No pet owner found in killer {} group", killer->GetName());
+    PETLOOT_LOG("No pet owner found in killer {} group", killer->GetName());
     return nullptr;
 }
 
@@ -320,31 +395,30 @@ public:
 
     void OnPlayerCreatureKill(Player* killer, Creature* victim) override
     {
-        LOG_INFO("module.pet_loot", "OnPlayerCreatureKill: hook fired (killer={})", killer != nullptr);
+        PETLOOT_LOG("OnPlayerCreatureKill: hook fired (killer={})", killer != nullptr);
         ProcessPetLoot(killer, victim);
     }
 
     void OnPlayerCreatureKilledByPet(Player* petOwner, Creature* victim) override
     {
-        LOG_INFO("module.pet_loot", "OnPlayerCreatureKilledByPet: hook fired (owner={})", petOwner != nullptr);
+        PETLOOT_LOG("OnPlayerCreatureKilledByPet: hook fired (owner={})", petOwner != nullptr);
         ProcessPetLoot(petOwner, victim);
     }
 
 private:
     void ProcessPetLoot(Player* player, Creature* victim)
     {
-        LOG_INFO("module.pet_loot", "ProcessPetLoot: entry");
+        PETLOOT_LOG("ProcessPetLoot: entry");
 
         if (!PetLootConfig::instance()->Enabled)
         {
-            LOG_INFO("module.pet_loot", "ProcessPetLoot: disabled");
+            PETLOOT_LOG("ProcessPetLoot: disabled");
             return;
         }
 
         if (!player || !victim)
         {
-            LOG_INFO("module.pet_loot", "ProcessPetLoot: null player={} victim={}",
-                     player != nullptr, victim != nullptr);
+            PETLOOT_LOG("ProcessPetLoot: null player={} victim={}", player != nullptr, victim != nullptr);
             return;
         }
 
@@ -352,37 +426,37 @@ private:
         Player* looter = FindPetLooter(player, victim);
         if (!looter)
         {
-            LOG_INFO("module.pet_loot", "ProcessPetLoot: no eligible pet owner (killer {})", player->GetName());
+            PETLOOT_LOG("ProcessPetLoot: no eligible pet owner (killer {})", player->GetName());
             return;
         }
 
-        // Check if the player has the required vanity pet (Bananas) summoned
+        // Check if the player has one of the configured vanity pets summoned
         ObjectGuid critterGuid = looter->GetCritterGUID();
         if (critterGuid.IsEmpty())
         {
-            LOG_INFO("module.pet_loot", "ProcessPetLoot: critter-guid-empty owner={}", looter->GetName());
+            PETLOOT_LOG("ProcessPetLoot: critter-guid-empty owner={}", looter->GetName());
             return;
         }
 
         Creature* critter = ObjectAccessor::GetCreature(*looter, critterGuid);
         if (!critter)
         {
-            LOG_INFO("module.pet_loot", "ProcessPetLoot: critter not found owner={}", looter->GetName());
+            PETLOOT_LOG("ProcessPetLoot: critter not found owner={}", looter->GetName());
             return;
         }
 
-        LOG_INFO("module.pet_loot", "ProcessPetLoot: critter found=true entry={} configured={}",
-                 critter->GetEntry(), PetLootConfig::instance()->PetId);
-        if (critter->GetEntry() != PetLootConfig::instance()->PetId)
+        PETLOOT_LOG("ProcessPetLoot: critter found=true entry={} configured-pets={}",
+                    critter->GetEntry(), PetLootConfig::instance()->PetIds.size());
+        if (!IsLootPet(critter->GetEntry()))
             return;
 
         // Distance check between player and victim
         float dist = looter->GetDistance(victim);
-        LOG_INFO("module.pet_loot", "ProcessPetLoot: dist={} radius={}", dist, PetLootConfig::instance()->Radius);
+        PETLOOT_LOG("ProcessPetLoot: dist={} radius={}", dist, PetLootConfig::instance()->Radius);
         if (dist > PetLootConfig::instance()->Radius)
             return;
 
-        LOG_INFO("module.pet_loot", "ProcessPetLoot: PASS moving pet owner={}", looter->GetName());
+        PETLOOT_LOG("ProcessPetLoot: PASS moving pet owner={}", looter->GetName());
 
         // Visual: Pet moves to the corpse
         critter->GetMotionMaster()->MovePoint(1, victim->GetPositionX(), victim->GetPositionY(), victim->GetPositionZ());
