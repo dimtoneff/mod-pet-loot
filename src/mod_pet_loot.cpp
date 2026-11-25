@@ -16,7 +16,9 @@
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <limits>
 #include <sstream>
 #include <set>
@@ -46,6 +48,12 @@ public:
     float Radius;
     float CacheTTL{30.0f};
     bool DebugLog{false};
+    bool AllowInDungeons{true};
+    bool AllowInRaids{true};
+    bool AllowInBattlegrounds{false};
+    bool AllowInArenas{false};
+    float SpeedMultiplier{1.0f};
+    bool RequireFreeForAll{false};
 
     // Prevents the pet from starting group loot rolls multiple times
     // for the same creature corpse.
@@ -59,6 +67,20 @@ public:
         CacheTTL = sConfigMgr->GetOption<float>("PetLoot.CacheTTL", 30.0f);
         if (CacheTTL < 0.0f)
             CacheTTL = 0.0f;
+
+        AllowInDungeons = sConfigMgr->GetOption<bool>("PetLoot.AllowInDungeons", true);
+        AllowInRaids = sConfigMgr->GetOption<bool>("PetLoot.AllowInRaids", true);
+        AllowInBattlegrounds = sConfigMgr->GetOption<bool>("PetLoot.AllowInBattlegrounds", false);
+        AllowInArenas = sConfigMgr->GetOption<bool>("PetLoot.AllowInArenas", false);
+        SpeedMultiplier = sConfigMgr->GetOption<float>("PetLoot.SpeedMultiplier", 1.0f);
+        if (!std::isfinite(SpeedMultiplier))
+            SpeedMultiplier = 1.0f;
+        else if (SpeedMultiplier < 0.1f)
+            SpeedMultiplier = 0.1f;
+        else if (SpeedMultiplier > 10.0f)
+            SpeedMultiplier = 10.0f;
+
+        RequireFreeForAll = sConfigMgr->GetOption<bool>("PetLoot.RequireFreeForAll", false);
 
         std::string petIdsCfg = sConfigMgr->GetOption<std::string>("PetLoot.PetIds",
             "23234,7547,25146,37865,29089,26119,36911,36511");
@@ -119,14 +141,39 @@ public:
             firstId = false;
         }
         std::string idsText = idsStream.str();
-        PETLOOT_LOG("Load: enabled={} radius={} cacheTTL={} debugLog={} petIds=[{}]",
-                    Enabled, Radius, CacheTTL, DebugLog, idsText);
+        PETLOOT_LOG("Load: enabled={} radius={} cacheTTL={} debugLog={} petIds=[{}]"
+                    " allowDungeons={} allowRaids={} allowBG={} allowArenas={}"
+                    " speed={} requireFFA={}",
+                    Enabled, Radius, CacheTTL, DebugLog, idsText,
+                    AllowInDungeons, AllowInRaids, AllowInBattlegrounds, AllowInArenas,
+                    SpeedMultiplier, RequireFreeForAll);
     }
 };
 
 static bool IsLootPet(uint32 entry)
 {
     return PetLootConfig::instance()->PetIds.count(entry) != 0;
+}
+
+static bool IsMapAllowed(Map const* map)
+{
+    if (!map)
+        return false;
+
+    PetLootConfig const* cfg = PetLootConfig::instance();
+    if (map->IsBattleArena())
+        return cfg->AllowInArenas;
+
+    if (map->IsBattleground())
+        return cfg->AllowInBattlegrounds;
+
+    if (map->IsRaid())
+        return cfg->AllowInRaids;
+
+    if (map->IsNonRaidDungeon())
+        return cfg->AllowInDungeons;
+
+    return true;
 }
 
 // Last valid pet owner per group. Every cached entry is fully revalidated before reuse.
@@ -314,6 +361,25 @@ public:
 
         if (pet->GetMap() != player->GetMap())
             return true;
+
+        // Re-check after the loot delay: config, map or loot method may have changed.
+        if (!IsMapAllowed(victim->GetMap()))
+        {
+            PETLOOT_LOG("PetLootEvent: map no longer allowed mapId={} owner={}",
+                        victim->GetMapId(), player->GetName());
+            return true;
+        }
+
+        if (PetLootConfig::instance()->RequireFreeForAll)
+        {
+            Group* group = player->GetGroup();
+            if (group && group->GetLootMethod() != FREE_FOR_ALL)
+            {
+                PETLOOT_LOG("PetLootEvent: requireFFA skip lootMethod={} owner={}",
+                            uint32(group->GetLootMethod()), player->GetName());
+                return true;
+            }
+        }
 
         pet->HandleEmoteCommand(EMOTE_ONESHOT_LOOT);
 
@@ -518,6 +584,23 @@ private:
             return;
         }
 
+        if (!IsMapAllowed(victim->GetMap()))
+        {
+            PETLOOT_LOG("ProcessPetLoot: map not allowed mapId={}", victim->GetMapId());
+            return;
+        }
+
+        if (PetLootConfig::instance()->RequireFreeForAll)
+        {
+            Group* group = player->GetGroup();
+            if (group && group->GetLootMethod() != FREE_FOR_ALL)
+            {
+                PETLOOT_LOG("ProcessPetLoot: requireFFA skip lootMethod={} player={}",
+                            uint32(group->GetLootMethod()), player->GetName());
+                return;
+            }
+        }
+
         // The killer may be a playerbot with no vanity pet; resolve the human pet owner first.
         Player* looter = FindPetLooter(player, victim);
         if (!looter)
@@ -555,6 +638,10 @@ private:
         PETLOOT_LOG("ProcessPetLoot: PASS moving pet owner={}", looter->GetName());
 
         // Visual: Pet moves to the corpse
+        float speedRate = std::clamp(PetLootConfig::instance()->SpeedMultiplier, 0.1f, 10.0f);
+        critter->SetSpeed(MOVE_RUN, speedRate, true);
+        critter->SetSpeed(MOVE_WALK, speedRate, true);
+        PETLOOT_LOG("ProcessPetLoot: applied speed rate={} owner={}", speedRate, looter->GetName());
         critter->GetMotionMaster()->MovePoint(1, victim->GetPositionX(), victim->GetPositionY(), victim->GetPositionZ());
 
         // Schedule the looting event

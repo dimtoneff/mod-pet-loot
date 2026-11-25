@@ -56,3 +56,58 @@ PetLoot.Radius = 50.0
 #                     0 - (Disabled, always rescan)
 
 PetLoot.CacheTTL = 30.0
+
+#
+#    PetLoot.AllowInDungeons
+#        Description: Allow the pet to loot in 5-player dungeon instances. 5-player dungeons
+#                     and raids are configured separately; open world is unaffected by these
+#                     instance toggles.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+PetLoot.AllowInDungeons = 1
+
+#
+#    PetLoot.AllowInRaids
+#        Description: Allow the pet to loot in raid instances.
+#        Default:     1 - (Enabled)
+#                     0 - (Disabled)
+
+PetLoot.AllowInRaids = 1
+
+#
+#    PetLoot.AllowInBattlegrounds
+#        Description: Allow the pet to loot in battleground (PvP) instances.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+PetLoot.AllowInBattlegrounds = 0
+
+#
+#    PetLoot.AllowInArenas
+#        Description: Allow the pet to loot in arena (PvP) instances.
+#        Default:     0 - (Disabled)
+#                     1 - (Enabled)
+
+PetLoot.AllowInArenas = 0
+
+#
+#    PetLoot.SpeedMultiplier
+#        Description: Movement-speed coefficient for the pet's trip to the corpse.
+#                     1 = normal, 2 = double, 3 = triple. Clamped to 0.1-10.0.
+#                     Normally only the outbound trip is affected; follow-home uses the
+#                     player's speed. The fixed 1s loot delay is unchanged.
+#        Default:     1.0
+
+PetLoot.SpeedMultiplier = 1.0
+
+#
+#    PetLoot.RequireFreeForAll
+#        Description: When enabled, the pet loots only if the group's loot method is
+#                     Free For All. Under Group Loot, Need Before Greed, Master Loot or
+#                     Round-Robin the pet does nothing. Solo kills are always allowed
+#                     (no group is treated as implicit Free For All).
+#        Default:     0 - (Disabled, loots under all loot methods)
+#                     1 - (Enabled, Free For All only)
+
+PetLoot.RequireFreeForAll = 0
