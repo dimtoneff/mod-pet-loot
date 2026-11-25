@@ -21,6 +21,7 @@
 #include <sstream>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Gate verbose per-kill/group-scan diagnostics behind PetLoot.DebugLog.
@@ -43,6 +44,7 @@ public:
     bool Enabled;
     std::set<uint32> PetIds;
     float Radius;
+    float CacheTTL{30.0f};
     bool DebugLog{false};
 
     // Prevents the pet from starting group loot rolls multiple times
@@ -54,6 +56,9 @@ public:
         Enabled = sConfigMgr->GetOption<bool>("PetLoot.Enable", true);
         DebugLog = sConfigMgr->GetOption<bool>("PetLoot.DebugLog", false);
         Radius = sConfigMgr->GetOption<float>("PetLoot.Radius", 50.0f);
+        CacheTTL = sConfigMgr->GetOption<float>("PetLoot.CacheTTL", 30.0f);
+        if (CacheTTL < 0.0f)
+            CacheTTL = 0.0f;
 
         std::string petIdsCfg = sConfigMgr->GetOption<std::string>("PetLoot.PetIds",
             "23234,7547,25146,37865,29089,26119,36911,36511");
@@ -114,7 +119,8 @@ public:
             firstId = false;
         }
         std::string idsText = idsStream.str();
-        PETLOOT_LOG("Load: enabled={} radius={} debugLog={} petIds=[{}]", Enabled, Radius, DebugLog, idsText);
+        PETLOOT_LOG("Load: enabled={} radius={} cacheTTL={} debugLog={} petIds=[{}]",
+                    Enabled, Radius, CacheTTL, DebugLog, idsText);
     }
 };
 
@@ -122,6 +128,16 @@ static bool IsLootPet(uint32 entry)
 {
     return PetLootConfig::instance()->PetIds.count(entry) != 0;
 }
+
+// Last valid pet owner per group. Every cached entry is fully revalidated before reuse.
+struct CachedLooter
+{
+    ObjectGuid playerGuid;
+    ObjectGuid critterGuid;
+    uint32 cachedAtMs{0};
+};
+static std::unordered_map<ObjectGuid /* group GUID */, CachedLooter> groupLooterCache;
+static constexpr uint32 CACHE_TTL_DISABLED = 0;
 
 // Resolve the player whose vanity pet should be moved to the corpse. The kill hook can
 // fire for a playerbot with no vanity pet, so fall back to the first eligible group member.
@@ -165,13 +181,82 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
     if (hasPetNear(killer, nullptr))
         return killer;
 
-    PETLOOT_LOG("Scanning group of killer {} for pet owner", killer->GetName());
     Group* group = killer->GetGroup();
     if (!group)
     {
         PETLOOT_LOG("No pet owner found: killer {} is not in a group", killer->GetName());
         return nullptr;
     }
+
+    const float cacheTTL = PetLootConfig::instance()->CacheTTL;
+    const bool useCache = cacheTTL > CACHE_TTL_DISABLED;
+    const double ttlMsD = double(cacheTTL) * 1000.0;
+    const uint32 ttlMs = ttlMsD >= double(std::numeric_limits<uint32>::max())
+                             ? std::numeric_limits<uint32>::max()
+                             : uint32(ttlMsD);
+
+    if (useCache)
+    {
+        // Lazily prune expired entries; the map is small (one entry per group).
+        for (auto itr = groupLooterCache.begin(); itr != groupLooterCache.end(); )
+        {
+            if (GetMSTimeDiffToNow(itr->second.cachedAtMs) > ttlMs)
+            {
+                PETLOOT_LOG("Cache entry expired for group {}", itr->first.ToString());
+                itr = groupLooterCache.erase(itr);
+            }
+            else
+                ++itr;
+        }
+
+        auto cached = groupLooterCache.find(group->GetGUID());
+        if (cached != groupLooterCache.end())
+        {
+            const CachedLooter& entry = cached->second;
+            Player* player = ObjectAccessor::FindPlayer(entry.playerGuid);
+
+            bool valid = player != nullptr;
+            if (valid)
+            {
+                valid = player->GetGroup() == group && player->IsAlive() &&
+                        player->GetSession() != nullptr && !player->GetSession()->IsHeadless() &&
+                        player->GetCritterGUID() == entry.critterGuid;
+            }
+
+            Creature* critter = nullptr;
+            if (valid)
+            {
+                critter = ObjectAccessor::GetCreature(*player, entry.critterGuid);
+                valid = critter != nullptr && critter->IsAlive() && IsLootPet(critter->GetEntry());
+            }
+
+            if (valid && (!player->IsInMap(victim) || !player->InSamePhase(victim) ||
+                          !critter->IsInMap(victim) || !critter->InSamePhase(victim)))
+                valid = false;
+
+            if (valid && player->GetDistance(victim) > PetLootConfig::instance()->Radius)
+                valid = false;
+
+            if (valid && GetMSTimeDiffToNow(entry.cachedAtMs) > ttlMs)
+            {
+                PETLOOT_LOG("Cache entry expired during validation; rescanning");
+                valid = false;
+            }
+
+            if (valid)
+            {
+                PETLOOT_LOG("Cache hit: reused pet looter {} critter entry {} dist {}",
+                            player->GetName(), critter->GetEntry(), player->GetDistance(victim));
+                return player;
+            }
+
+            PETLOOT_LOG("Cache miss: cached pet owner for killer {} no longer valid; rescanning",
+                        killer->GetName());
+            groupLooterCache.erase(cached);
+        }
+    }
+
+    PETLOOT_LOG("Scanning group of killer {} for pet owner", killer->GetName());
 
     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
     {
@@ -190,9 +275,19 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
         {
             PETLOOT_LOG("Selected pet looter {} critter entry {} dist {}",
                         member->GetName(), critter->GetEntry(), member->GetDistance(victim));
+            if (useCache)
+            {
+                groupLooterCache[group->GetGUID()] =
+                    CachedLooter{ member->GetGUID(), critter->GetGUID(), getMSTime() };
+                PETLOOT_LOG("Cached pet looter {} for group of killer {}",
+                            member->GetName(), killer->GetName());
+            }
             return member;
         }
     }
+
+    if (useCache)
+        groupLooterCache.erase(group->GetGUID());
 
     PETLOOT_LOG("No pet owner found in killer {} group", killer->GetName());
     return nullptr;
@@ -385,6 +480,7 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         PetLootConfig::instance()->Load();
+        groupLooterCache.clear();
     }
 };
 

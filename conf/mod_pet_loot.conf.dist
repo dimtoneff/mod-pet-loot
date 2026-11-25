@@ -46,3 +46,13 @@ PetLoot.DebugLog = 0
 #        Default:     50.0
 
 PetLoot.Radius = 50.0
+
+#
+#    PetLoot.CacheTTL
+#        Description: Seconds to reuse a group's previously found pet owner before a fresh scan is required.
+#                     Every cached entry is fully revalidated on each kill: pet dismiss/death, player leaving
+#                     the group, map/phase or distance changes force a fresh scan.
+#        Default:     30.0
+#                     0 - (Disabled, always rescan)
+
+PetLoot.CacheTTL = 30.0

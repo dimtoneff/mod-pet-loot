@@ -37,6 +37,8 @@ Phoenix Hatchling, Pandaren Monk and Spectral Tiger Cub).
   (default: 23234,7547,25146,37865,29089,26119,36911,36511 - Bananas, Azure Whelpling, Golden Pig,
   Perky Pug, Mini Tyrael, Phoenix Hatchling, Pandaren Monk, Spectral Tiger Cub).
 - `PetLoot.Radius`: Maximum distance for looting (default: 50.0 yards).
+- `PetLoot.CacheTTL`: Seconds to reuse a group's previously found pet owner before a fresh scan
+  (default: 30.0 seconds; 0 disables caching). Every cached entry is fully revalidated on each kill.
 - `PetLoot.DebugLog`: Enable verbose per-kill/group-scan diagnostics in the worldserver log (default: 0 - disabled).
 
 ## License
