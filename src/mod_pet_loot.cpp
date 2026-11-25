@@ -7,6 +7,7 @@
 #include "Config.h"
 #include "Chat.h"
 #include "Creature.h"
+#include "Log.h"
 #include "LootMgr.h"
 #include "ObjectAccessor.h"
 #include "Group.h"
@@ -41,8 +42,86 @@ public:
         Enabled = sConfigMgr->GetOption<bool>("PetLoot.Enable", true);
         PetId = sConfigMgr->GetOption<uint32>("PetLoot.PetId", 23234); // Default: Bananas
         Radius = sConfigMgr->GetOption<float>("PetLoot.Radius", 50.0f);
+
+        LOG_INFO("module.pet_loot", "Load: enabled={} petId={} radius={}",
+                 Enabled, PetLootConfig::instance()->PetId, PetLootConfig::instance()->Radius);
     }
 };
+
+// Resolve the player whose vanity pet should be moved to the corpse. The kill hook can
+// fire for a playerbot with no vanity pet, so fall back to the first eligible group member.
+static Player* FindPetLooter(Player* killer, Creature* victim)
+{
+    if (!killer || !victim)
+        return nullptr;
+
+    auto hasPetNear = [victim](Player* player, Creature** outCritter) -> bool
+    {
+        if (!player || !player->IsAlive() || !player->GetSession() || player->GetSession()->IsHeadless())
+            return false;
+
+        ObjectGuid critterGuid = player->GetCritterGUID();
+        if (critterGuid.IsEmpty())
+            return false;
+
+        Creature* critter = ObjectAccessor::GetCreature(*player, critterGuid);
+        if (!critter || !critter->IsAlive() || critter->GetEntry() != PetLootConfig::instance()->PetId)
+            return false;
+
+        if (!player->IsInMap(victim) || !player->InSamePhase(victim) ||
+            !critter->IsInMap(victim) || !critter->InSamePhase(victim))
+        {
+            LOG_INFO("module.pet_loot", "Candidate {} skipped: different map or phase", player->GetName());
+            return false;
+        }
+
+        if (player->GetDistance(victim) > PetLootConfig::instance()->Radius)
+            return false;
+
+        if (outCritter)
+            *outCritter = critter;
+
+        return true;
+    };
+
+    if (killer->GetSession() && killer->GetSession()->IsHeadless())
+        LOG_INFO("module.pet_loot", "Killer {} skipped: headless (bot) session", killer->GetName());
+
+    if (hasPetNear(killer, nullptr))
+        return killer;
+
+    LOG_INFO("module.pet_loot", "Scanning group of killer {} for pet owner", killer->GetName());
+    Group* group = killer->GetGroup();
+    if (!group)
+    {
+        LOG_INFO("module.pet_loot", "No pet owner found: killer {} is not in a group", killer->GetName());
+        return nullptr;
+    }
+
+    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* member = itr->GetSource();
+        if (!member)
+            continue;
+
+        if (member->GetSession() && member->GetSession()->IsHeadless())
+        {
+            LOG_INFO("module.pet_loot", "Group member {} skipped: headless (bot) session", member->GetName());
+            continue;
+        }
+
+        Creature* critter = nullptr;
+        if (hasPetNear(member, &critter))
+        {
+            LOG_INFO("module.pet_loot", "Selected pet looter {} critter entry {} dist {}",
+                     member->GetName(), critter->GetEntry(), member->GetDistance(victim));
+            return member;
+        }
+    }
+
+    LOG_INFO("module.pet_loot", "No pet owner found in killer {} group", killer->GetName());
+    return nullptr;
+}
 
 // Event to handle the actual looting after the pet reaches the corpse
 class PetLootEvent : public BasicEvent
@@ -73,8 +152,13 @@ public:
         {
             if (auto cTemplate = victim->GetCreatureTemplate())
             {
-                bool personal = (player->GetGroup() == nullptr);
-                victim->loot.FillLoot(cTemplate->lootid, LootTemplates_Creature, player, personal);
+                // Some creatures have no loot table.
+                // Avoid calling FillLoot with lootid 0 to prevent console errors.
+                if (cTemplate->lootid)
+                {
+                    bool personal = (player->GetGroup() == nullptr);
+                    victim->loot.FillLoot(cTemplate->lootid, LootTemplates_Creature, player, personal);
+                }
             }
         }
 
@@ -236,43 +320,76 @@ public:
 
     void OnPlayerCreatureKill(Player* killer, Creature* victim) override
     {
+        LOG_INFO("module.pet_loot", "OnPlayerCreatureKill: hook fired (killer={})", killer != nullptr);
         ProcessPetLoot(killer, victim);
     }
 
     void OnPlayerCreatureKilledByPet(Player* petOwner, Creature* victim) override
     {
+        LOG_INFO("module.pet_loot", "OnPlayerCreatureKilledByPet: hook fired (owner={})", petOwner != nullptr);
         ProcessPetLoot(petOwner, victim);
     }
 
 private:
     void ProcessPetLoot(Player* player, Creature* victim)
     {
+        LOG_INFO("module.pet_loot", "ProcessPetLoot: entry");
+
         if (!PetLootConfig::instance()->Enabled)
+        {
+            LOG_INFO("module.pet_loot", "ProcessPetLoot: disabled");
             return;
+        }
 
         if (!player || !victim)
+        {
+            LOG_INFO("module.pet_loot", "ProcessPetLoot: null player={} victim={}",
+                     player != nullptr, victim != nullptr);
             return;
+        }
+
+        // The killer may be a playerbot with no vanity pet; resolve the human pet owner first.
+        Player* looter = FindPetLooter(player, victim);
+        if (!looter)
+        {
+            LOG_INFO("module.pet_loot", "ProcessPetLoot: no eligible pet owner (killer {})", player->GetName());
+            return;
+        }
 
         // Check if the player has the required vanity pet (Bananas) summoned
-        ObjectGuid critterGuid = player->GetCritterGUID();
+        ObjectGuid critterGuid = looter->GetCritterGUID();
         if (critterGuid.IsEmpty())
+        {
+            LOG_INFO("module.pet_loot", "ProcessPetLoot: critter-guid-empty owner={}", looter->GetName());
             return;
+        }
 
-        Creature* critter = ObjectAccessor::GetCreature(*player, critterGuid);
-        if (!critter || critter->GetEntry() != PetLootConfig::instance()->PetId)
+        Creature* critter = ObjectAccessor::GetCreature(*looter, critterGuid);
+        if (!critter)
+        {
+            LOG_INFO("module.pet_loot", "ProcessPetLoot: critter not found owner={}", looter->GetName());
+            return;
+        }
+
+        LOG_INFO("module.pet_loot", "ProcessPetLoot: critter found=true entry={} configured={}",
+                 critter->GetEntry(), PetLootConfig::instance()->PetId);
+        if (critter->GetEntry() != PetLootConfig::instance()->PetId)
             return;
 
         // Distance check between player and victim
-        float dist = player->GetDistance(victim);
+        float dist = looter->GetDistance(victim);
+        LOG_INFO("module.pet_loot", "ProcessPetLoot: dist={} radius={}", dist, PetLootConfig::instance()->Radius);
         if (dist > PetLootConfig::instance()->Radius)
             return;
+
+        LOG_INFO("module.pet_loot", "ProcessPetLoot: PASS moving pet owner={}", looter->GetName());
 
         // Visual: Pet moves to the corpse
         critter->GetMotionMaster()->MovePoint(1, victim->GetPositionX(), victim->GetPositionY(), victim->GetPositionZ());
 
         // Schedule the looting event
         uint32 delay = 1000;
-        player->m_Events.AddEvent(new PetLootEvent(player->GetGUID(), victim->GetGUID(), critter->GetGUID()), player->m_Events.CalculateTime(delay));
+        looter->m_Events.AddEvent(new PetLootEvent(looter->GetGUID(), victim->GetGUID(), critter->GetGUID()), looter->m_Events.CalculateTime(delay));
     }
 };
 
