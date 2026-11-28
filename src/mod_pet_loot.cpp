@@ -17,9 +17,12 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <set>
 #include <string>
@@ -27,25 +30,20 @@
 #include <vector>
 
 // Gate verbose per-kill/group-scan diagnostics behind PetLoot.DebugLog.
-#define PETLOOT_LOG(...)                                                 \
-    do {                                                                 \
-        if (PetLootConfig::instance()->DebugLog)                         \
-            LOG_INFO("module.pet_loot", __VA_ARGS__);                    \
+// Each log call takes one config snapshot; readers never touch shared state directly.
+#define PETLOOT_LOG(...)                                                    \
+    do {                                                                    \
+        auto petLootLogCfg = PetLootConfig::Current();                      \
+        if (petLootLogCfg && petLootLogCfg->DebugLog)                        \
+            LOG_INFO("module.pet_loot", __VA_ARGS__);                       \
     } while (false)
 
-// Configuration class to store module settings
-class PetLootConfig
+// Immutable configuration, replaced atomically on reload.
+struct PetLootConfigData
 {
-public:
-    static PetLootConfig* instance()
-    {
-        static PetLootConfig instance;
-        return &instance;
-    }
-
-    bool Enabled;
+    bool Enabled{true};
     std::set<uint32> PetIds;
-    float Radius;
+    float Radius{50.0f};
     float CacheTTL{30.0f};
     bool DebugLog{false};
     bool AllowInDungeons{true};
@@ -54,37 +52,54 @@ public:
     bool AllowInArenas{false};
     float SpeedMultiplier{1.0f};
     bool RequireFreeForAll{false};
+};
 
-    // Prevents the pet from starting group loot rolls multiple times
-    // for the same creature corpse.
-    std::set<ObjectGuid> GroupLootStarted;
+// Configuration class to store module settings
+class PetLootConfig
+{
+public:
+    using Snapshot = std::shared_ptr<const PetLootConfigData>;
 
+    static PetLootConfig* instance()
+    {
+        static PetLootConfig instance;
+        return &instance;
+    }
+
+    // One coherent snapshot per reader; never dereference the shared state directly.
+    static Snapshot Current()
+    {
+        return instance()->config.load(std::memory_order_acquire);
+    }
+
+    // Called on the main thread. Build a fresh object, then publish it with a single store.
     void Load()
     {
-        Enabled = sConfigMgr->GetOption<bool>("PetLoot.Enable", true);
-        DebugLog = sConfigMgr->GetOption<bool>("PetLoot.DebugLog", false);
-        Radius = sConfigMgr->GetOption<float>("PetLoot.Radius", 50.0f);
-        CacheTTL = sConfigMgr->GetOption<float>("PetLoot.CacheTTL", 30.0f);
-        if (CacheTTL < 0.0f)
-            CacheTTL = 0.0f;
+        auto cfg = std::make_shared<PetLootConfigData>();
 
-        AllowInDungeons = sConfigMgr->GetOption<bool>("PetLoot.AllowInDungeons", true);
-        AllowInRaids = sConfigMgr->GetOption<bool>("PetLoot.AllowInRaids", true);
-        AllowInBattlegrounds = sConfigMgr->GetOption<bool>("PetLoot.AllowInBattlegrounds", false);
-        AllowInArenas = sConfigMgr->GetOption<bool>("PetLoot.AllowInArenas", false);
-        SpeedMultiplier = sConfigMgr->GetOption<float>("PetLoot.SpeedMultiplier", 1.0f);
-        if (!std::isfinite(SpeedMultiplier))
-            SpeedMultiplier = 1.0f;
-        else if (SpeedMultiplier < 0.1f)
-            SpeedMultiplier = 0.1f;
-        else if (SpeedMultiplier > 10.0f)
-            SpeedMultiplier = 10.0f;
+        cfg->Enabled = sConfigMgr->GetOption<bool>("PetLoot.Enable", true);
+        cfg->DebugLog = sConfigMgr->GetOption<bool>("PetLoot.DebugLog", false);
+        cfg->Radius = sConfigMgr->GetOption<float>("PetLoot.Radius", 50.0f);
+        cfg->CacheTTL = sConfigMgr->GetOption<float>("PetLoot.CacheTTL", 30.0f);
+        if (cfg->CacheTTL < 0.0f)
+            cfg->CacheTTL = 0.0f;
 
-        RequireFreeForAll = sConfigMgr->GetOption<bool>("PetLoot.RequireFreeForAll", false);
+        cfg->AllowInDungeons = sConfigMgr->GetOption<bool>("PetLoot.AllowInDungeons", true);
+        cfg->AllowInRaids = sConfigMgr->GetOption<bool>("PetLoot.AllowInRaids", true);
+        cfg->AllowInBattlegrounds = sConfigMgr->GetOption<bool>("PetLoot.AllowInBattlegrounds", false);
+        cfg->AllowInArenas = sConfigMgr->GetOption<bool>("PetLoot.AllowInArenas", false);
+        cfg->SpeedMultiplier = sConfigMgr->GetOption<float>("PetLoot.SpeedMultiplier", 1.0f);
+        if (!std::isfinite(cfg->SpeedMultiplier))
+            cfg->SpeedMultiplier = 1.0f;
+        else if (cfg->SpeedMultiplier < 0.1f)
+            cfg->SpeedMultiplier = 0.1f;
+        else if (cfg->SpeedMultiplier > 10.0f)
+            cfg->SpeedMultiplier = 10.0f;
+
+        cfg->RequireFreeForAll = sConfigMgr->GetOption<bool>("PetLoot.RequireFreeForAll", false);
 
         std::string petIdsCfg = sConfigMgr->GetOption<std::string>("PetLoot.PetIds",
             "23234,7547,25146,37865,29089,26119,36911,36511");
-        PetIds.clear();
         std::istringstream petIdsStream(petIdsCfg);
         std::string token;
         while (std::getline(petIdsStream, token, ','))
@@ -117,7 +132,7 @@ public:
             {
                 unsigned long value = std::stoul(id);
                 if (value <= std::numeric_limits<uint32>::max())
-                    PetIds.insert(static_cast<uint32>(value));
+                    cfg->PetIds.insert(static_cast<uint32>(value));
             }
             catch (...)
             {
@@ -125,15 +140,18 @@ public:
             }
         }
 
-        if (PetIds.empty())
+        if (cfg->PetIds.empty())
         {
-            PETLOOT_LOG("PetLoot.PetIds parsed to empty; using default pet list");
-            PetIds.insert({ 23234, 7547, 25146, 37865, 29089, 26119, 36911, 36511 });
+            // Log from the fresh local object: the published snapshot is still the old one here.
+            if (cfg->DebugLog)
+                LOG_INFO("module.pet_loot", "PetLoot.PetIds parsed to empty; using default pet list");
+
+            cfg->PetIds.insert({ 23234, 7547, 25146, 37865, 29089, 26119, 36911, 36511 });
         }
 
         std::ostringstream idsStream;
         bool firstId = true;
-        for (uint32 petId : PetIds)
+        for (uint32 petId : cfg->PetIds)
         {
             if (!firstId)
                 idsStream << ',';
@@ -141,26 +159,31 @@ public:
             firstId = false;
         }
         std::string idsText = idsStream.str();
-        PETLOOT_LOG("Load: enabled={} radius={} cacheTTL={} debugLog={} petIds=[{}]"
-                    " allowDungeons={} allowRaids={} allowBG={} allowArenas={}"
-                    " speed={} requireFFA={}",
-                    Enabled, Radius, CacheTTL, DebugLog, idsText,
-                    AllowInDungeons, AllowInRaids, AllowInBattlegrounds, AllowInArenas,
-                    SpeedMultiplier, RequireFreeForAll);
+        if (cfg->DebugLog)
+            LOG_INFO("module.pet_loot", "Load: enabled={} radius={} cacheTTL={} debugLog={} petIds=[{}]"
+                     " allowDungeons={} allowRaids={} allowBG={} allowArenas={}"
+                     " speed={} requireFFA={}",
+                     cfg->Enabled, cfg->Radius, cfg->CacheTTL, cfg->DebugLog, idsText,
+                     cfg->AllowInDungeons, cfg->AllowInRaids, cfg->AllowInBattlegrounds,
+                     cfg->AllowInArenas, cfg->SpeedMultiplier, cfg->RequireFreeForAll);
+
+        config.store(cfg, std::memory_order_release);
     }
+
+private:
+    std::atomic<Snapshot> config{};
 };
 
-static bool IsLootPet(uint32 entry)
+static bool IsLootPet(uint32 entry, PetLootConfig::Snapshot const& cfg)
 {
-    return PetLootConfig::instance()->PetIds.count(entry) != 0;
+    return cfg && cfg->PetIds.count(entry) != 0;
 }
 
-static bool IsMapAllowed(Map const* map)
+static bool IsMapAllowed(Map const* map, PetLootConfig::Snapshot const& cfg)
 {
-    if (!map)
+    if (!map || !cfg)
         return false;
 
-    PetLootConfig const* cfg = PetLootConfig::instance();
     if (map->IsBattleArena())
         return cfg->AllowInArenas;
 
@@ -183,17 +206,29 @@ struct CachedLooter
     ObjectGuid critterGuid;
     uint32 cachedAtMs{0};
 };
-static std::unordered_map<ObjectGuid /* group GUID */, CachedLooter> groupLooterCache;
 static constexpr uint32 CACHE_TTL_DISABLED = 0;
+
+// Runtime state shared by map threads. The instance is intentionally leaked so a late lookup
+// during shutdown still finds a valid lock and container (see ObjectAccessor.cpp:61-97).
+struct PetLootRuntimeState
+{
+    std::mutex Lock;
+    std::unordered_map<ObjectGuid /* group GUID */, CachedLooter> groupLooterCache;
+};
+static PetLootRuntimeState* PetLootState()
+{
+    static PetLootRuntimeState* state = new PetLootRuntimeState();
+    return state;
+}
 
 // Resolve the player whose vanity pet should be moved to the corpse. The kill hook can
 // fire for a playerbot with no vanity pet, so fall back to the first eligible group member.
-static Player* FindPetLooter(Player* killer, Creature* victim)
+static Player* FindPetLooter(Player* killer, Creature* victim, PetLootConfig::Snapshot const& cfg)
 {
-    if (!killer || !victim)
+    if (!killer || !victim || !cfg)
         return nullptr;
 
-    auto hasPetNear = [victim](Player* player, Creature** outCritter) -> bool
+    auto hasPetNear = [victim, &cfg](Player* player, Creature** outCritter) -> bool
     {
         if (!player || !player->IsAlive() || !player->GetSession() || player->GetSession()->IsHeadless())
             return false;
@@ -203,7 +238,7 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
             return false;
 
         Creature* critter = ObjectAccessor::GetCreature(*player, critterGuid);
-        if (!critter || !critter->IsAlive() || !IsLootPet(critter->GetEntry()))
+        if (!critter || !critter->IsAlive() || !IsLootPet(critter->GetEntry(), cfg))
             return false;
 
         if (!player->IsInMap(victim) || !player->InSamePhase(victim) ||
@@ -213,7 +248,7 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
             return false;
         }
 
-        if (player->GetDistance(victim) > PetLootConfig::instance()->Radius)
+        if (player->GetDistance(victim) > cfg->Radius)
             return false;
 
         if (outCritter)
@@ -235,32 +270,55 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
         return nullptr;
     }
 
-    const float cacheTTL = PetLootConfig::instance()->CacheTTL;
+    const float cacheTTL = cfg->CacheTTL;
     const bool useCache = cacheTTL > CACHE_TTL_DISABLED;
     const double ttlMsD = double(cacheTTL) * 1000.0;
     const uint32 ttlMs = ttlMsD >= double(std::numeric_limits<uint32>::max())
                              ? std::numeric_limits<uint32>::max()
                              : uint32(ttlMsD);
 
+    ObjectGuid groupGuid = group->GetGUID();
     if (useCache)
     {
+        PetLootRuntimeState* state = PetLootState();
+        std::vector<ObjectGuid> expiredGroups;
+
         // Lazily prune expired entries; the map is small (one entry per group).
-        for (auto itr = groupLooterCache.begin(); itr != groupLooterCache.end(); )
+        // Only container operations happen under the lock; logging is done afterwards.
         {
-            if (GetMSTimeDiffToNow(itr->second.cachedAtMs) > ttlMs)
+            std::lock_guard<std::mutex> guard(state->Lock);
+            auto& cache = state->groupLooterCache;
+            for (auto itr = cache.begin(); itr != cache.end(); )
             {
-                PETLOOT_LOG("Cache entry expired for group {}", itr->first.ToString());
-                itr = groupLooterCache.erase(itr);
+                if (GetMSTimeDiffToNow(itr->second.cachedAtMs) > ttlMs)
+                {
+                    expiredGroups.push_back(itr->first);
+                    itr = cache.erase(itr);
+                }
+                else
+                    ++itr;
             }
-            else
-                ++itr;
         }
 
-        auto cached = groupLooterCache.find(group->GetGUID());
-        if (cached != groupLooterCache.end())
+        for (ObjectGuid const& expiredGroup : expiredGroups)
+            PETLOOT_LOG("Cache entry expired for group {}", expiredGroup.ToString());
+
+        // Copy the candidate under the lock, then validate it without holding the lock.
+        bool haveCached = false;
+        CachedLooter entry;
         {
-            const CachedLooter& entry = cached->second;
-            Player* player = ObjectAccessor::FindPlayer(entry.playerGuid);
+            std::lock_guard<std::mutex> guard(state->Lock);
+            auto cached = state->groupLooterCache.find(groupGuid);
+            if (cached != state->groupLooterCache.end())
+            {
+                entry = cached->second;
+                haveCached = true;
+            }
+        }
+
+        if (haveCached)
+        {
+            Player* player = ObjectAccessor::GetPlayer(*killer, entry.playerGuid);
 
             bool valid = player != nullptr;
             if (valid)
@@ -274,14 +332,14 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
             if (valid)
             {
                 critter = ObjectAccessor::GetCreature(*player, entry.critterGuid);
-                valid = critter != nullptr && critter->IsAlive() && IsLootPet(critter->GetEntry());
+                valid = critter != nullptr && critter->IsAlive() && IsLootPet(critter->GetEntry(), cfg);
             }
 
             if (valid && (!player->IsInMap(victim) || !player->InSamePhase(victim) ||
                           !critter->IsInMap(victim) || !critter->InSamePhase(victim)))
                 valid = false;
 
-            if (valid && player->GetDistance(victim) > PetLootConfig::instance()->Radius)
+            if (valid && player->GetDistance(victim) > cfg->Radius)
                 valid = false;
 
             if (valid && GetMSTimeDiffToNow(entry.cachedAtMs) > ttlMs)
@@ -299,7 +357,20 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
 
             PETLOOT_LOG("Cache miss: cached pet owner for killer {} no longer valid; rescanning",
                         killer->GetName());
-            groupLooterCache.erase(cached);
+
+            // Erase only if this is still the entry we validated; another worker may have
+            // written a newer owner in the meantime.
+            {
+                std::lock_guard<std::mutex> guard(state->Lock);
+                auto cached = state->groupLooterCache.find(groupGuid);
+                if (cached != state->groupLooterCache.end() &&
+                    cached->second.playerGuid == entry.playerGuid &&
+                    cached->second.critterGuid == entry.critterGuid &&
+                    cached->second.cachedAtMs == entry.cachedAtMs)
+                {
+                    state->groupLooterCache.erase(cached);
+                }
+            }
         }
     }
 
@@ -324,8 +395,12 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
                         member->GetName(), critter->GetEntry(), member->GetDistance(victim));
             if (useCache)
             {
-                groupLooterCache[group->GetGUID()] =
-                    CachedLooter{ member->GetGUID(), critter->GetGUID(), getMSTime() };
+                PetLootRuntimeState* state = PetLootState();
+                {
+                    std::lock_guard<std::mutex> guard(state->Lock);
+                    state->groupLooterCache[groupGuid] =
+                        CachedLooter{ member->GetGUID(), critter->GetGUID(), getMSTime() };
+                }
                 PETLOOT_LOG("Cached pet looter {} for group of killer {}",
                             member->GetName(), killer->GetName());
             }
@@ -333,8 +408,8 @@ static Player* FindPetLooter(Player* killer, Creature* victim)
         }
     }
 
-    if (useCache)
-        groupLooterCache.erase(group->GetGUID());
+    // No unconditional erase here: invalid entries are already removed by the compare-and-erase
+    // above and TTL pruning handles expiry; a fresh entry written by another worker must survive.
 
     PETLOOT_LOG("No pet owner found in killer {} group", killer->GetName());
     return nullptr;
@@ -349,6 +424,12 @@ public:
 
     bool Execute(uint64 /*e_time*/, uint32 /*p_time*/) override
     {
+        // Fresh snapshot: this event runs after a delay, so loot-time config may legitimately
+        // differ from kill-time config (e.g. after a reload); the re-checks below are intentional.
+        auto cfg = PetLootConfig::Current();
+        if (!cfg)
+            return true;
+
         Player* player = ObjectAccessor::FindPlayer(_playerGuid);
         if (!player)
             return true;
@@ -362,15 +443,21 @@ public:
         if (pet->GetMap() != player->GetMap())
             return true;
 
+        // The core clears loot and removes UNIT_DYNFLAG_LOOTABLE when a corpse is fully looted,
+        // which also resets loot_type to LOOT_NONE. Ignore such corpses so a second scheduled
+        // event cannot refill them and start another roll.
+        if (!victim->HasDynamicFlag(UNIT_DYNFLAG_LOOTABLE))
+            return true;
+
         // Re-check after the loot delay: config, map or loot method may have changed.
-        if (!IsMapAllowed(victim->GetMap()))
+        if (!IsMapAllowed(victim->GetMap(), cfg))
         {
             PETLOOT_LOG("PetLootEvent: map no longer allowed mapId={} owner={}",
                         victim->GetMapId(), player->GetName());
             return true;
         }
 
-        if (PetLootConfig::instance()->RequireFreeForAll)
+        if (cfg->RequireFreeForAll)
         {
             Group* group = player->GetGroup();
             if (group && group->GetLootMethod() != FREE_FOR_ALL)
@@ -398,6 +485,10 @@ public:
             }
         }
 
+        // Check the per-loot marker before touching loot_type. Core uses the same gate when a
+        // player opens the corpse, so this avoids a second roll during the pet's 1s delay.
+        bool rollsNeeded = (victim->loot.loot_type == LOOT_NONE);
+
         // Mark corpse loot as already initialized.
         // This must be done even if FillLoot was not called,
         // otherwise manual looting will start group rolls again.
@@ -407,31 +498,24 @@ public:
         LootMethod lootMethod = group ? group->GetLootMethod() : FREE_FOR_ALL;
 
         // Trigger group loot system once.
-        if (group && lootMethod != FREE_FOR_ALL)
+        if (rollsNeeded && group && lootMethod != FREE_FOR_ALL)
         {
-            auto& startedLoots = PetLootConfig::instance()->GroupLootStarted;
-
-            if (!startedLoots.count(victim->GetGUID()))
+            switch (lootMethod)
             {
-                switch (lootMethod)
-                {
-                    case GROUP_LOOT:
-                        group->GroupLoot(&victim->loot, victim);
-                        break;
+                case GROUP_LOOT:
+                    group->GroupLoot(&victim->loot, victim);
+                    break;
 
-                    case NEED_BEFORE_GREED:
-                        group->NeedBeforeGreed(&victim->loot, victim);
-                        break;
+                case NEED_BEFORE_GREED:
+                    group->NeedBeforeGreed(&victim->loot, victim);
+                    break;
 
-                    case MASTER_LOOT:
-                        group->MasterLoot(&victim->loot, victim);
-                        break;
+                case MASTER_LOOT:
+                    group->MasterLoot(&victim->loot, victim);
+                    break;
 
-                    default:
-                        break;
-                }
-
-                startedLoots.insert(victim->GetGUID());
+                default:
+                    break;
             }
         }
 
@@ -520,8 +604,6 @@ public:
         // Cleanup corpse visual and decay if empty
         if (victim->loot.isLooted())
         {
-            PetLootConfig::instance()->GroupLootStarted.erase(victim->GetGUID());
-
             victim->RemoveFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE);
             victim->AllLootRemovedFromCorpse();
         }
@@ -546,7 +628,8 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         PetLootConfig::instance()->Load();
-        groupLooterCache.clear();
+        std::lock_guard<std::mutex> guard(PetLootState()->Lock);
+        PetLootState()->groupLooterCache.clear();
     }
 };
 
@@ -570,9 +653,11 @@ public:
 private:
     void ProcessPetLoot(Player* player, Creature* victim)
     {
+        // Kill-time snapshot, shared by all checks and passed down to the helpers.
+        auto cfg = PetLootConfig::Current();
         PETLOOT_LOG("ProcessPetLoot: entry");
 
-        if (!PetLootConfig::instance()->Enabled)
+        if (!cfg || !cfg->Enabled)
         {
             PETLOOT_LOG("ProcessPetLoot: disabled");
             return;
@@ -584,13 +669,13 @@ private:
             return;
         }
 
-        if (!IsMapAllowed(victim->GetMap()))
+        if (!IsMapAllowed(victim->GetMap(), cfg))
         {
             PETLOOT_LOG("ProcessPetLoot: map not allowed mapId={}", victim->GetMapId());
             return;
         }
 
-        if (PetLootConfig::instance()->RequireFreeForAll)
+        if (cfg->RequireFreeForAll)
         {
             Group* group = player->GetGroup();
             if (group && group->GetLootMethod() != FREE_FOR_ALL)
@@ -602,7 +687,7 @@ private:
         }
 
         // The killer may be a playerbot with no vanity pet; resolve the human pet owner first.
-        Player* looter = FindPetLooter(player, victim);
+        Player* looter = FindPetLooter(player, victim, cfg);
         if (!looter)
         {
             PETLOOT_LOG("ProcessPetLoot: no eligible pet owner (killer {})", player->GetName());
@@ -625,20 +710,20 @@ private:
         }
 
         PETLOOT_LOG("ProcessPetLoot: critter found=true entry={} configured-pets={}",
-                    critter->GetEntry(), PetLootConfig::instance()->PetIds.size());
-        if (!IsLootPet(critter->GetEntry()))
+                    critter->GetEntry(), cfg->PetIds.size());
+        if (!IsLootPet(critter->GetEntry(), cfg))
             return;
 
         // Distance check between player and victim
         float dist = looter->GetDistance(victim);
-        PETLOOT_LOG("ProcessPetLoot: dist={} radius={}", dist, PetLootConfig::instance()->Radius);
-        if (dist > PetLootConfig::instance()->Radius)
+        PETLOOT_LOG("ProcessPetLoot: dist={} radius={}", dist, cfg->Radius);
+        if (dist > cfg->Radius)
             return;
 
         PETLOOT_LOG("ProcessPetLoot: PASS moving pet owner={}", looter->GetName());
 
         // Visual: Pet moves to the corpse
-        float speedRate = std::clamp(PetLootConfig::instance()->SpeedMultiplier, 0.1f, 10.0f);
+        float speedRate = std::clamp(cfg->SpeedMultiplier, 0.1f, 10.0f);
         critter->SetSpeed(MOVE_RUN, speedRate, true);
         critter->SetSpeed(MOVE_WALK, speedRate, true);
         PETLOOT_LOG("ProcessPetLoot: applied speed rate={} owner={}", speedRate, looter->GetName());
